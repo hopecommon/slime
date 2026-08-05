@@ -335,7 +335,13 @@ async def generate_and_rm_group(
             asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
         )
 
-    group = await asyncio.gather(*tasks)
+    try:
+        group = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:
@@ -347,7 +353,12 @@ async def generate_and_rm_group(
     return group
 
 
-async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
+async def abort(
+    args: Namespace,
+    rollout_id: int,
+    *,
+    raise_on_engine_error: bool = False,
+) -> list[list[Sample]]:
     aborted_samples = []
 
     state = GenerateState(args)
@@ -364,9 +375,14 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     logger.info(f"Abort request for {urls}")
     abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
     abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
+    abort_errors = []
     for url, result in zip(urls, abort_results, strict=False):
         if isinstance(result, Exception):
             logger.warning(f"Failed to abort worker at {url}: {result}")
+            abort_errors.append(f"{url}: {type(result).__name__}: {result}")
+
+    if abort_errors and raise_on_engine_error:
+        raise RuntimeError("failed to abort rollout engines: " + "; ".join(abort_errors))
 
     # make sure all the pending tasks are finished
     count = 0
