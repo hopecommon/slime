@@ -33,6 +33,15 @@ def get_gloo_group():
     return GLOO_GROUP
 
 
+def destroy_gloo_group():
+    """Destroy and forget the auxiliary Gloo process group."""
+    global GLOO_GROUP
+    group = GLOO_GROUP
+    GLOO_GROUP = None
+    if group is not None:
+        dist.destroy_process_group(group)
+
+
 # Copy from pytorch to allow creating multiple main groups.
 # https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
 def init_process_group(

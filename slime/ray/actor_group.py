@@ -6,6 +6,8 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, add_default_ray_env_vars
 
+TRAIN_ACTOR_SHUTDOWN_TIMEOUT_SECONDS = 180.0
+
 
 class RayTrainGroup:
     """
@@ -39,9 +41,19 @@ class RayTrainGroup:
         self._num_nodes = num_nodes
         self._num_gpus_per_node = num_gpus_per_node
         self.role = role
+        self._actor_handlers = []
 
         # Allocate the GPUs for actors w/o instantiating them
-        self._allocate_gpus_for_actor(pg, num_gpus_per_actor)
+        try:
+            self._allocate_gpus_for_actor(pg, num_gpus_per_actor)
+        except BaseException:
+            for actor in self._actor_handlers:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except BaseException:
+                    pass
+            self._actor_handlers = []
+            raise
 
     def _allocate_gpus_for_actor(self, pg, num_gpus_per_actor):
         world_size = self._num_nodes * self._num_gpus_per_node
@@ -94,7 +106,6 @@ class RayTrainGroup:
         )
 
         # Create worker actors
-        self._actor_handlers = []
         master_addr, master_port = None, None
         for rank in range(world_size):
             actor = TrainRayActor.options(
@@ -155,6 +166,35 @@ class RayTrainGroup:
 
     def clear_memory(self):
         return ray.get([actor.clear_memory.remote() for actor in self._actor_handlers])
+
+    def shutdown(self, timeout=TRAIN_ACTOR_SHUTDOWN_TIMEOUT_SECONDS):
+        actors = self._actor_handlers
+        self._actor_handlers = []
+        if not actors:
+            return
+
+        shutdown_error = None
+        kill_errors = []
+        try:
+            ray.get(
+                [actor.shutdown.remote() for actor in actors],
+                timeout=timeout,
+            )
+        except BaseException as exc:
+            shutdown_error = exc
+        finally:
+            for actor in actors:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except BaseException as exc:
+                    kill_errors.append(exc)
+
+        if shutdown_error is not None:
+            raise shutdown_error
+        if kill_errors:
+            raise RuntimeError(
+                "; ".join(f"{type(error).__name__}: {error}" for error in kill_errors)
+            ) from kill_errors[0]
 
     def set_rollout_manager(self, rollout_manager):
         return ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])

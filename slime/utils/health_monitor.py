@@ -3,7 +3,6 @@ import threading
 
 import ray
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -58,7 +57,7 @@ class RolloutHealthMonitor:
         logger.info("RolloutHealthMonitor started (in paused state).")
         return True
 
-    def stop(self) -> None:
+    def stop(self, timeout: float | None = None) -> None:
         """Stop the health monitor thread completely. Called during dispose."""
         if not self._thread:
             return
@@ -69,17 +68,21 @@ class RolloutHealthMonitor:
         # Also clear pause to let the thread exit
         if self._pause_event:
             self._pause_event.clear()
-        timeout = self._check_timeout + self._check_interval + 5
+        self._is_checking_enabled = False
+        if timeout is None:
+            timeout = self._check_timeout + self._check_interval + 5
+        if timeout < 0:
+            raise ValueError("health monitor stop timeout cannot be negative")
         self._thread.join(timeout=timeout)
         if self._thread.is_alive():
-            logging.warning("Rollout health monitor thread did not terminate within %.1fs", timeout)
-        else:
-            logger.info("RolloutHealthMonitor stopped.")
+            raise TimeoutError(
+                f"rollout health monitor thread did not terminate within {timeout:.1f}s"
+            )
+        logger.info("RolloutHealthMonitor stopped.")
 
         self._thread = None
         self._stop_event = None
         self._pause_event = None
-        self._is_checking_enabled = False
 
     def pause(self) -> None:
         """Pause health checking. Called when engines are offloaded."""

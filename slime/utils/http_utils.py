@@ -151,6 +151,7 @@ _client_concurrency: int = 0
 _distributed_post_enabled: bool = False
 _post_actors: list[object] = []
 _post_actor_idx: int = 0
+HTTP_CLIENT_SHUTDOWN_TIMEOUT_SECONDS = 30.0
 
 
 def _next_actor():
@@ -182,9 +183,7 @@ async def _post(client, url, payload, max_retries=60, headers=None):
             else:
                 response_text = None
 
-            logger.info(
-                f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, response={response_text})"
-            )
+            logger.info(f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, response={response_text})")
             if retry_count >= max_retries:
                 logger.info(f"Max retries ({max_retries}) reached, failing... (url={url})")
                 raise e
@@ -265,6 +264,9 @@ def _init_ray_distributed_post(args):
         async def do_post(self, url, payload, max_retries=60, headers=None):
             return await _post(self._client, url, payload, max_retries, headers=headers)
 
+        async def close(self):
+            await self._client.aclose()
+
     # Create actors per node
     created = []
     total_actors = max(1, len(nodes) * args.num_gpus_per_node)
@@ -276,7 +278,6 @@ def _init_ray_distributed_post(args):
         for _ in range(args.num_gpus_per_node):
             actor = _HttpPosterActor.options(
                 name=None,
-                lifetime="detached",
                 runtime_env={"env_vars": add_default_ray_env_vars()},
                 scheduling_strategy=scheduling,
                 max_concurrency=per_actor_conc,
@@ -286,6 +287,55 @@ def _init_ray_distributed_post(args):
             created.append(actor)
 
     _post_actors = created
+
+
+def shutdown_http_client() -> None:
+    """Close local HTTP resources and terminate distributed POST actors."""
+
+    global _http_client, _client_concurrency, _distributed_post_enabled
+    global _post_actors, _post_actor_idx
+
+    client = _http_client
+    actors = _post_actors
+    _http_client = None
+    _client_concurrency = 0
+    _distributed_post_enabled = False
+    _post_actors = []
+    _post_actor_idx = 0
+
+    errors = []
+    if actors:
+        import ray
+
+        try:
+            ray.get(
+                [actor.close.remote() for actor in actors],
+                timeout=HTTP_CLIENT_SHUTDOWN_TIMEOUT_SECONDS,
+            )
+        except BaseException as exc:
+            errors.append(f"distributed POST close: {type(exc).__name__}: {exc}")
+        finally:
+            for actor in actors:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except BaseException as exc:
+                    errors.append(f"distributed POST kill: {type(exc).__name__}: {exc}")
+
+    if client is not None:
+        from slime.utils.async_utils import run
+
+        try:
+            run(
+                asyncio.wait_for(
+                    client.aclose(),
+                    timeout=HTTP_CLIENT_SHUTDOWN_TIMEOUT_SECONDS,
+                )
+            )
+        except BaseException as exc:
+            errors.append(f"HTTP client close: {type(exc).__name__}: {exc}")
+
+    if errors:
+        raise RuntimeError("; ".join(errors))
 
 
 async def post(url, payload, max_retries=60, headers=None):

@@ -1,4 +1,5 @@
 import dataclasses
+import importlib
 import itertools
 import logging
 import multiprocessing
@@ -21,7 +22,14 @@ from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
 from slime.utils.dp_schedule import build_dp_schedule
 from slime.utils.health_monitor import RolloutHealthMonitor
-from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
+from slime.utils.http_utils import (
+    _wrap_ipv6,
+    find_available_port,
+    get_host_info,
+    init_http_client,
+    shutdown_http_client,
+    terminate_process,
+)
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
@@ -35,6 +43,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+ROLLOUT_ENGINE_SHUTDOWN_TIMEOUT_SECONDS = 60.0
+_router_processes: list[multiprocessing.Process] = []
 
 _SGLANG_REQUEST_PERF_FIELDS = (
     ("request/e2e_latency", "e2e_latency"),
@@ -469,9 +480,85 @@ class RolloutManager:
                 logger.warning(f"CI Fault Injection failed: {e}")
 
     def dispose(self):
+        errors = []
+        monitors_to_retry = []
+        try:
+            self._run_rollout_hook("shutdown_rollout")
+        except BaseException as exc:
+            errors.append(f"rollout shutdown: {type(exc).__name__}: {exc}")
         for monitor in self._health_monitors:
-            monitor.stop()
-        logging_utils.finish_tracking(self.args)
+            try:
+                monitor.stop()
+            except TimeoutError:
+                monitors_to_retry.append(monitor)
+            except BaseException as exc:
+                errors.append(f"health monitor stop: {type(exc).__name__}: {exc}")
+        try:
+            self._shutdown_rollout_servers()
+        except BaseException as exc:
+            errors.append(f"rollout server shutdown: {type(exc).__name__}: {exc}")
+        for monitor in monitors_to_retry:
+            try:
+                monitor.stop()
+            except BaseException as exc:
+                errors.append(f"health monitor stop after engine shutdown: {type(exc).__name__}: {exc}")
+        try:
+            shutdown_http_client()
+        except BaseException as exc:
+            errors.append(f"HTTP shutdown: {type(exc).__name__}: {exc}")
+        try:
+            logging_utils.finish_tracking(self.args)
+        except BaseException as exc:
+            errors.append(f"tracking shutdown: {type(exc).__name__}: {exc}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+    def _shutdown_rollout_servers(self):
+        engines = []
+        seen_engine_ids = set()
+        for server in self.servers.values():
+            for engine in server.all_engines:
+                if engine is None or id(engine) in seen_engine_ids:
+                    continue
+                seen_engine_ids.add(id(engine))
+                engines.append(engine)
+
+        errors = []
+        if engines:
+            try:
+                ray.get(
+                    [engine.shutdown.remote() for engine in engines],
+                    timeout=ROLLOUT_ENGINE_SHUTDOWN_TIMEOUT_SECONDS,
+                )
+            except BaseException as exc:
+                errors.append(f"engine shutdown: {type(exc).__name__}: {exc}")
+            finally:
+                for engine in engines:
+                    try:
+                        ray.kill(engine, no_restart=True)
+                    except BaseException as exc:
+                        errors.append(f"engine kill: {type(exc).__name__}: {exc}")
+
+        while _router_processes:
+            process = _router_processes.pop()
+            try:
+                terminate_process(process, timeout=5.0)
+            except BaseException as exc:
+                errors.append(f"router shutdown: {type(exc).__name__}: {exc}")
+
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+    def quiesce(self):
+        return self._run_rollout_hook("quiesce_rollout")
+
+    def _run_rollout_hook(self, hook_name: str):
+        rollout_module_name = self.args.rollout_function_path.rpartition(".")[0]
+        rollout_module = importlib.import_module(rollout_module_name)
+        hook = getattr(rollout_module, hook_name, None)
+        if hook is not None:
+            return hook()
+        return None
 
     @property
     def server(self) -> Any | None:
@@ -503,6 +590,7 @@ class RolloutManager:
         ``update_weights=True``.  Frozen models (reference, reward,
         etc.) are automatically excluded.
         """
+        self.quiesce()
         srv = self._get_updatable_server()
         engines = srv.engines if srv else []
         gpu_counts = srv.engine_gpu_counts if srv else []
@@ -533,6 +621,11 @@ class RolloutManager:
         if self.args.debug_train_only:
             # if debug train only, we don't generate evaluation data
             return
+        rollout_module_name = self.args.rollout_function_path.rpartition(".")[0]
+        rollout_module = importlib.import_module(rollout_module_name)
+        if getattr(rollout_module, "FULLY_ASYNC_SUPPORTS_EVALUATION", True) is False:
+            raise ValueError("evaluation is not supported with the fully-async rollout worker")
+        self.quiesce()
         self.health_monitoring_resume()
 
         result = call_rollout_fn(self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True)
@@ -541,12 +634,14 @@ class RolloutManager:
         _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
 
     def save(self, rollout_id):
+        self.quiesce()
         self.data_source.save(rollout_id)
 
     def load(self, rollout_id=None):
         self.data_source.load(rollout_id)
 
     def offload(self):
+        self.quiesce()
         self.health_monitoring_pause()
         for srv in self.servers.values():
             srv.offload()
@@ -569,6 +664,7 @@ class RolloutManager:
         Recovers the updatable model (the one that receives weight
         updates from training).
         """
+        self.quiesce()
         self.health_monitoring_pause()
         srv = self._get_updatable_server()
         if self.rollout_id == -1 or srv is None:
@@ -1009,6 +1105,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     )
     process.daemon = True  # Set the process as a daemon
     process.start()
+    _router_processes.append(process)
     # Wait 3 seconds
     time.sleep(3)
     assert process.is_alive()

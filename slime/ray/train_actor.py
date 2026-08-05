@@ -10,7 +10,7 @@ import torch.distributed as dist
 
 import slime.utils.eval_config
 from slime.ray.ray_actor import RayActor
-from slime.utils.distributed_utils import init_gloo_group
+from slime.utils.distributed_utils import destroy_gloo_group, init_gloo_group
 from slime.utils.logging_utils import configure_logger
 from slime.utils.memory_utils import clear_memory, print_memory
 
@@ -97,6 +97,22 @@ class TrainRayActor(RayActor):
         print_memory("before TrainRayActor.clear_memory")
         clear_memory()
         print_memory("after TrainRayActor.clear_memory")
+
+    def shutdown(self):
+        errors = []
+        try:
+            destroy_gloo_group()
+        except BaseException as exc:
+            errors.append(exc)
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        except BaseException as exc:
+            errors.append(exc)
+        if errors:
+            raise RuntimeError(
+                "; ".join(f"{type(error).__name__}: {error}" for error in errors)
+            ) from errors[0]
 
     @abc.abstractmethod
     def sleep(self, tags):
