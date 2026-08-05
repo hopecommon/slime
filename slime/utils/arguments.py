@@ -604,6 +604,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="The data source class for rollout data.",
             )
             parser.add_argument(
+                "--dressage-overlength-policy",
+                choices=("error", "truncate"),
+                default="error",
+                help=(
+                    "How Dressage handles a proxy segment larger than "
+                    "seq_length or max_tokens_per_gpu * context_parallel_size. "
+                    "The default fails closed; truncation requires explicit opt-in."
+                ),
+            )
+            parser.add_argument(
                 "--prompt-data",
                 type=str,
                 default=None,
