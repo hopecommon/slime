@@ -48,6 +48,7 @@ class _CompletedGroup:
 class _ActiveGroup:
     gid: int
     original: list[Sample]
+    generated: list[Sample] | None = None
 
 
 class WorkerPhase(Enum):
@@ -64,8 +65,9 @@ _global_worker: AsyncRolloutWorker | None = None
 _worker_lock = threading.Lock()
 
 
-def _get_global_worker(args, data_buffer) -> AsyncRolloutWorker:
+def _get_global_worker(args, data_buffer, *, worker_factory=None) -> AsyncRolloutWorker:
     global _global_worker
+    worker_factory = worker_factory or AsyncRolloutWorker
     unsupported_options = {
         "dynamic_sampling_filter_path": getattr(args, "dynamic_sampling_filter_path", None),
         "rollout_sample_filter_path": getattr(args, "rollout_sample_filter_path", None),
@@ -86,13 +88,15 @@ def _get_global_worker(args, data_buffer) -> AsyncRolloutWorker:
             if concurrency <= 0:
                 raise ValueError("fully-async rollout requires at least one rollout engine")
             logger.info("starting fully-async rollout worker")
-            _global_worker = AsyncRolloutWorker(
+            _global_worker = worker_factory(
                 args,
                 data_buffer,
                 concurrency=concurrency,
             )
             _global_worker.start()
         worker = _global_worker
+    if type(worker) is not worker_factory:
+        raise RuntimeError("fully-async rollout cannot switch a live worker factory")
     if worker.data_buffer is not data_buffer:
         raise RuntimeError("fully-async rollout worker cannot switch data sources")
     worker.ensure_healthy()
@@ -115,7 +119,7 @@ def shutdown_rollout() -> None:
     try:
         worker.shutdown()
     finally:
-        if not worker.is_alive():
+        if not worker.is_alive() and not worker.has_pending_resources():
             with _worker_lock:
                 if _global_worker is worker:
                     _global_worker = None
@@ -247,6 +251,10 @@ class AsyncRolloutWorker:
     def is_alive(self) -> bool:
         return self.worker_thread is not None and self.worker_thread.is_alive()
 
+    def has_pending_resources(self) -> bool:
+        """Keep a failed worker addressable while its extension owns resources."""
+        return False
+
     def get_completed_groups(self, limit: int) -> list[_CompletedGroup]:
         if limit <= 0:
             return []
@@ -302,26 +310,20 @@ class AsyncRolloutWorker:
                         retry = self._retry_groups.pop(0)
                         work_items = [retry]
                     else:
-                        groups = self.data_buffer.get_samples(1)
-                        if not groups:
+                        work_items, next_gid = self._take_work(next_gid)
+                        if not work_items:
                             source_empty = True
                             break
-                        work_items = []
-                        for original in groups:
-                            work_items.append(_ActiveGroup(next_gid, original))
-                            next_gid += 1
                     for item in work_items:
                         original = item.original
-                        generated = copy.deepcopy(original)
+                        generated = item.generated if item.generated is not None else copy.deepcopy(original)
+                        item.generated = None
                         task = asyncio.create_task(
-                            generate_and_rm_group(
-                                self.args,
-                                generated,
-                                sampling_params=self.state.sampling_params.copy(),
-                                evaluation=False,
-                            )
+                            self._run_group(item, generated, self.state.sampling_params.copy())
                         )
                         active[task] = item
+
+                next_gid = self._prefetch_work(next_gid)
 
                 if source_empty and not active and self.output_queue.empty():
                     raise RuntimeError("fully-async data source returned no samples")
@@ -358,6 +360,21 @@ class AsyncRolloutWorker:
         finally:
             await self._quiesce_active(active)
             self._paused.set()
+
+    def _take_work(self, next_gid: int) -> tuple[list[_ActiveGroup], int]:
+        groups = self.data_buffer.get_samples(1)
+        return ([_ActiveGroup(next_gid + offset, group) for offset, group in enumerate(groups)],
+                next_gid + len(groups))
+
+    def _prefetch_work(self, next_gid: int) -> int:
+        return next_gid
+
+    async def _run_group(self, item: _ActiveGroup, generated: list[Sample], sampling_params: dict):
+        return await generate_and_rm_group(self.args, generated,
+            sampling_params=sampling_params, evaluation=False)
+
+    async def _quiesce_resources(self, restore: list[_ActiveGroup]) -> None:
+        """Join extension resources before the source owner checkpoints."""
 
     async def _quiesce_active(
         self,
@@ -408,6 +425,10 @@ class AsyncRolloutWorker:
             external_restore = self._external_restore
             self._external_restore = []
         restore.extend(_ActiveGroup(completed.gid, completed.original) for completed in external_restore)
+        try:
+            await self._quiesce_resources(restore)
+        except BaseException as exc:
+            self._set_failure(exc, context="failed to release fully-async worker resources")
         self._restore_groups(restore)
         if self.state is not None:
             self.state.reset()
@@ -490,10 +511,12 @@ async def _generate_rollout_async(
     args,
     rollout_id: int,
     data_buffer,
+    *,
+    worker_factory=None,
 ) -> list[GeneratedGroup]:
     if not args.rollout_global_dataset:
         raise ValueError("fully-async rollout requires a global dataset")
-    worker = _get_global_worker(args, data_buffer)
+    worker = _get_global_worker(args, data_buffer, worker_factory=worker_factory)
     worker.resume(rollout_id)
 
     target = args.rollout_batch_size
@@ -546,7 +569,7 @@ def _completed_group_key(item: _CompletedGroup) -> int:
     return item.gid
 
 
-def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation=False):
+def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation=False, *, worker_factory=None):
     """Slime rollout entrypoint with bounded cross-batch prefetch."""
 
     model_routers = getattr(args, "sglang_model_routers", None)
@@ -556,4 +579,4 @@ def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation=False
         )
     if evaluation:
         raise ValueError("fully-async rollout does not support evaluation mode")
-    return run(_generate_rollout_async(args, rollout_id, data_buffer))
+    return run(_generate_rollout_async(args, rollout_id, data_buffer, worker_factory=worker_factory))
