@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import torch
 import torch.distributed as dist
@@ -9,8 +9,6 @@ from megatron.core import mpu
 def get_logits_and_tokens_offset_with_cp(
     total_length: int,
     response_length: int,
-    qkv_format: str = "thd",
-    max_seq_len: int | None = None,
 ):
     """
     All offsets start from the begining of the prompt.
@@ -20,11 +18,7 @@ def get_logits_and_tokens_offset_with_cp(
     assert cp_size > 1
 
     prompt_length = total_length - response_length
-    if qkv_format == "thd":
-        chunk_size = (total_length + 2 * cp_size - 1) // (2 * cp_size)
-    else:
-        assert max_seq_len is not None, "max_seq_len must be provided for qkv_format=bshd"
-        chunk_size = (max_seq_len + 2 * cp_size - 1) // (2 * cp_size)
+    chunk_size = (total_length + 2 * cp_size - 1) // (2 * cp_size)
 
     # the offset of 2 chunks
     chunk_0 = (cp_rank * chunk_size, (cp_rank + 1) * chunk_size)
@@ -56,8 +50,6 @@ def get_sum_of_sample_mean(
     loss_masks: list[torch.Tensor],
     sample_denoms: list[torch.Tensor] | torch.Tensor | None = None,
     calculate_per_token_loss: bool = False,
-    qkv_format: str = "thd",
-    max_seq_lens: list[int] | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """
     Calculate correct sample mean for CP.
@@ -100,18 +92,14 @@ def get_sum_of_sample_mean(
         cp_chunk_lengths: list[int] = []
         chunked_loss_masks: list[torch.Tensor] = []
 
-        for i, (total_length, response_length, loss_mask) in enumerate(
-            zip(total_lengths, response_lengths, loss_masks, strict=False)
-        ):
-            max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
+        for total_length, response_length, loss_mask in zip(total_lengths, response_lengths, loss_masks, strict=False):
             prompt_length = total_length - response_length
-            _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
-                total_length, response_length, qkv_format, max_seq_len
-            )
+            _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(total_length, response_length)
             loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
             loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
-            chunked_loss_masks.append(torch.cat([loss_mask_0, loss_mask_1], dim=0))
-            cp_chunk_lengths.append(chunked_loss_masks[i].size(0))
+            chunked_loss_mask = torch.cat([loss_mask_0, loss_mask_1], dim=0)
+            chunked_loss_masks.append(chunked_loss_mask)
+            cp_chunk_lengths.append(chunked_loss_mask.size(0))
 
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
@@ -299,14 +287,9 @@ def all_gather_with_cp(tensor: torch.Tensor, total_length: int, response_length:
 def slice_with_cp(
     tokens: torch.Tensor,
     pad_value: tuple[int, float, Callable],
-    qkv_format: str = "thd",
-    max_seq_len: int | None = None,
 ) -> torch.Tensor:
     cp_rank = mpu.get_context_parallel_rank()
     cp_size = mpu.get_context_parallel_world_size()
-
-    if qkv_format == "bshd":
-        assert max_seq_len is not None
 
     def pad_tokens(tokens, pad):
         if isinstance(pad_value, Callable):
@@ -319,16 +302,10 @@ def slice_with_cp(
         return tokens
 
     if cp_size == 1:
-        if qkv_format == "bshd":
-            pad = max_seq_len - tokens.size(0)
-            tokens = pad_tokens(tokens, pad)
         return tokens
 
     token_len = len(tokens)
-    if qkv_format == "thd":
-        chunk_size = (token_len + 2 * cp_size - 1) // (2 * cp_size)
-    else:
-        chunk_size = (max_seq_len + 2 * cp_size - 1) // (2 * cp_size)
+    chunk_size = (token_len + 2 * cp_size - 1) // (2 * cp_size)
 
     # pad
     pad = 2 * cp_size * chunk_size - token_len
@@ -344,8 +321,6 @@ def slice_log_prob_with_cp(
     log_prob: list[float] | torch.Tensor,
     total_length: int,
     response_length: int,
-    qkv_format: str = "thd",
-    max_token_len: int | None = None,
 ) -> list[float] | torch.Tensor:
     assert len(log_prob) == response_length, (
         f"log_prob length mismatch: len(log_prob)={len(log_prob)}, "
@@ -358,9 +333,7 @@ def slice_log_prob_with_cp(
         return log_prob
 
     prompt_length = total_length - response_length
-    _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(
-        total_length, response_length, qkv_format, max_token_len
-    )
+    _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(total_length, response_length)
 
     chunk_1 = log_prob[logits_offset[0][0] - (prompt_length - 1) : logits_offset[0][1] - (prompt_length - 1)]
     chunk_2 = log_prob[logits_offset[1][0] - (prompt_length - 1) : logits_offset[1][1] - (prompt_length - 1)]
@@ -369,3 +342,64 @@ def slice_log_prob_with_cp(
         return chunk_1 + chunk_2
     else:
         return torch.cat([chunk_1, chunk_2], dim=0)
+
+
+def _pad_routed_experts(experts: torch.Tensor, pad: int, num_experts: int) -> torch.Tensor:
+    if pad == 0:
+        return experts
+    _, num_layers, topk = experts.shape
+    pad_experts = (
+        torch.arange(
+            pad * num_layers * topk,
+            device=experts.device,
+            dtype=experts.dtype,
+        ).reshape((pad, num_layers, topk))
+        % num_experts
+    )
+    return torch.cat([experts, pad_experts], dim=0)
+
+
+def prepare_routed_experts_for_routing_replay(
+    rollout_routed_experts: Sequence[torch.Tensor],
+    tokens: Sequence[torch.Tensor],
+    *,
+    num_experts: int,
+    data_pad_size_multiplier: int,
+    sequence_parallel: bool,
+    allgather_cp: bool,
+) -> torch.Tensor:
+    """Align rollout routed-experts metadata with the training token layout."""
+    assert len(rollout_routed_experts) == len(tokens)
+    for experts, token_ids in zip(rollout_routed_experts, tokens, strict=False):
+        assert experts.shape[0] == token_ids.shape[0] - 1, f"{experts.shape}, {token_ids.shape}"
+
+    padded_experts = [_pad_routed_experts(experts, 1, num_experts) for experts in rollout_routed_experts]
+    pad_size = mpu.get_tensor_model_parallel_world_size() * data_pad_size_multiplier
+
+    if allgather_cp:
+        routed_experts = torch.cat(padded_experts, dim=0)
+        cp_size = mpu.get_context_parallel_world_size()
+        cp_rank = mpu.get_context_parallel_rank()
+        global_pad_size = cp_size * pad_size
+        pad = (global_pad_size - routed_experts.size(0) % global_pad_size) % global_pad_size
+        routed_experts = _pad_routed_experts(routed_experts, pad, num_experts)
+        routed_experts = routed_experts.chunk(cp_size, dim=0)[cp_rank]
+    else:
+        routed_experts = [
+            slice_with_cp(experts, lambda x, pad: _pad_routed_experts(x, pad, num_experts))
+            for experts in padded_experts
+        ]
+        routed_experts = torch.cat(routed_experts, dim=0)
+        pad = (pad_size - routed_experts.size(0) % pad_size) % pad_size
+        routed_experts = _pad_routed_experts(routed_experts, pad, num_experts)
+
+    if sequence_parallel:
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        seqlen = routed_experts.size(0)
+        assert seqlen % tp_size == 0
+        start = seqlen // tp_size * tp_rank
+        end = seqlen // tp_size * (tp_rank + 1)
+        routed_experts = routed_experts[start:end]
+
+    return routed_experts

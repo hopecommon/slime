@@ -112,7 +112,7 @@ def _get_placement_group_layout(args) -> tuple[int, int]:
         return args.rollout_num_gpus, 0
 
     if args.colocate:
-        return actor_num_gpus, 0
+        return max(actor_num_gpus, args.rollout_num_gpus), 0
 
     return actor_num_gpus + args.rollout_num_gpus, actor_num_gpus
 
@@ -137,7 +137,16 @@ def create_placement_groups(args):
     return result
 
 
-def allocate_train_group(args, num_nodes, num_gpus_per_node, pg, role="actor"):
+def allocate_train_group(
+    args,
+    num_nodes,
+    num_gpus_per_node,
+    pg,
+    role="actor",
+    with_ref=False,
+    with_opd_teacher=False,
+    actor_cls=None,
+):
     return RayTrainGroup(
         args=args,
         num_nodes=num_nodes,
@@ -145,25 +154,41 @@ def allocate_train_group(args, num_nodes, num_gpus_per_node, pg, role="actor"):
         pg=pg,
         num_gpus_per_actor=0.4,
         role=role,
+        with_ref=with_ref,
+        with_opd_teacher=with_opd_teacher,
+        actor_cls=actor_cls,
     )
 
 
-def create_training_models(args, pgs, rollout_manager):
-    actor_model = None
-    critic_model = None
+def create_actor_model(args, pgs, rollout_manager, actor_cls=None):
     actor_args = args
     if args.megatron_config_path is not None:
         from slime.utils.arguments import parse_megatron_role_args
 
         actor_args = parse_megatron_role_args(args, args.megatron_config_path, role="actor")
 
+    actor_model_kwargs = {}
+    if actor_cls is not None:
+        actor_model_kwargs["actor_cls"] = actor_cls
+    actor_model = allocate_train_group(
+        args=actor_args,
+        num_nodes=args.actor_num_nodes,
+        num_gpus_per_node=args.actor_num_gpus_per_node,
+        pg=pgs["actor"],
+        with_ref=actor_args.kl_coef != 0 or actor_args.use_kl_loss,
+        with_opd_teacher=actor_args.use_opd and actor_args.opd_type == "megatron",
+        **actor_model_kwargs,
+    )
+    actor_start_rollout_ids = actor_model.create(rollout_manager=rollout_manager)
+    return actor_model, actor_start_rollout_ids
+
+
+def create_training_models(args, pgs, rollout_manager, actor_cls=None):
+    actor_model = None
+    critic_model = None
     try:
-        actor_model = allocate_train_group(
-            args=actor_args,
-            num_nodes=args.actor_num_nodes,
-            num_gpus_per_node=args.actor_num_gpus_per_node,
-            pg=pgs["actor"],
-        )
+        actor_model, actor_start_rollout_ids = create_actor_model(args, pgs, rollout_manager, actor_cls=actor_cls)
+
         if args.use_critic:
             from slime.utils.arguments import parse_megatron_role_args
 
@@ -182,18 +207,8 @@ def create_training_models(args, pgs, rollout_manager):
                 pg=pgs["critic"],
                 role="critic",
             )
-            critic_start_rollout_ids = ray.get(
-                critic_model.async_init(critic_model.args, role="critic", with_ref=False)
-            )
+            critic_start_rollout_ids = critic_model.create(rollout_manager=rollout_manager)
 
-        actor_start_rollout_ids = ray.get(
-            actor_model.async_init(
-                actor_args,
-                role="actor",
-                with_ref=actor_args.kl_coef != 0 or actor_args.use_kl_loss,
-                with_opd_teacher=actor_args.use_opd and actor_args.opd_type == "megatron",
-            )
-        )
         # TODO how to decide rollout start id when critic is involved? For now we just require user to specify it via args.
         if args.use_critic:
             start_rollout_ids = critic_start_rollout_ids
@@ -204,10 +219,6 @@ def create_training_models(args, pgs, rollout_manager):
 
         if args.start_rollout_id is None:
             args.start_rollout_id = start_rollout_ids[0]
-
-        actor_model.set_rollout_manager(rollout_manager)
-        if args.use_critic:
-            critic_model.set_rollout_manager(rollout_manager)
 
         if args.rollout_global_dataset:
             ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
@@ -227,11 +238,14 @@ def create_training_models(args, pgs, rollout_manager):
 def create_rollout_manager(args, pg):
     from .rollout import RolloutManager
 
-    rollout_manager = RolloutManager.options(
-        num_cpus=1,
-        num_gpus=0,
-        runtime_env={"env_vars": add_default_ray_env_vars()},
-    ).remote(args, pg)
+    rollout_manager_options = {
+        "num_cpus": 1,
+        "num_gpus": 0,
+        "runtime_env": {"env_vars": add_default_ray_env_vars()},
+    }
+    if getattr(args, "rollout_data_transport", "object-store") == "nixl":
+        rollout_manager_options["enable_tensor_transport"] = True
+    rollout_manager = RolloutManager.options(**rollout_manager_options).remote(args, pg)
 
     # calculate num_rollout from num_epoch
     num_rollout_per_epoch = None

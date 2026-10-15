@@ -1,13 +1,14 @@
-"""E2E smoke test for disk-backed delta weight updates.
+"""E2E smoke test for colocated ``--release-train``.
 
-Runs a tiny Qwen3.5-0.8B job so the first weight update seeds the delta
-snapshot and the post-train update publishes sparse delta files through
-``update_weights_from_disk(load_format="delta", files=...)``.
+The job runs two rollout steps so the actor group is released after each disk
+weight update, then recreated from the saved Megatron checkpoint before the next
+training step.
 """
 
 import os
 import tempfile
 from pathlib import Path
+from shlex import quote
 
 import slime.utils.external_utils.command_utils as U
 
@@ -15,6 +16,7 @@ import slime.utils.external_utils.command_utils as U
 MODEL_NAME = "Qwen3.5-0.8B"
 MODEL_TYPE = "qwen3.5-0.8B"
 NUM_GPUS = 4
+NUM_ROLLOUT = 2
 TORCH_DIST_CKPT = f"/dev/shm/{MODEL_NAME}_torch_dist"
 
 
@@ -31,8 +33,17 @@ def prepare():
 
 
 def execute():
-    with tempfile.TemporaryDirectory(prefix="slime_delta_weight_update_") as delta_dir:
-        ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load {TORCH_DIST_CKPT} "
+    with tempfile.TemporaryDirectory(prefix="slime_release_train_") as work_dir:
+        save_dir = Path(work_dir) / "mcore"
+        update_weight_dir = Path(work_dir) / "update_weight"
+
+        ckpt_args = (
+            f"--hf-checkpoint /root/models/{MODEL_NAME}/ "
+            f"--ref-load {TORCH_DIST_CKPT} "
+            "--release-train "
+            f"--save {quote(str(save_dir))} "
+            "--save-interval 1 "
+        )
 
         rollout_args = (
             "--prompt-data /root/datasets/gsm8k/train.parquet "
@@ -41,10 +52,10 @@ def execute():
             "--apply-chat-template "
             "--rollout-shuffle "
             "--rm-type math "
-            "--num-rollout 1 "
+            f"--num-rollout {NUM_ROLLOUT} "
             "--rollout-batch-size 4 "
             "--n-samples-per-prompt 4 "
-            "--rollout-max-response-len 1024 "
+            "--rollout-max-response-len 512 "
             "--rollout-temperature 0.8 "
             "--over-sampling-batch-size 8 "
             "--dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std "
@@ -67,9 +78,6 @@ def execute():
             "--use-kl-loss "
             "--kl-loss-coef 0.00 "
             "--kl-loss-type low_var_kl "
-            # Nonzero entropy coef guarantees a nonzero gradient even when all
-            # rewards in a group tie (advantages=0), so the delta sync writes
-            # real sparse files instead of an empty no-op.
             "--entropy-coef 0.01 "
             "--eps-clip 0.2 "
             "--eps-clip-high 0.28 "
@@ -86,18 +94,15 @@ def execute():
 
         sglang_args = (
             "--rollout-num-gpus-per-engine 1 "
-            "--rollout-num-gpus 3 "
             "--sglang-mem-fraction-static 0.7 "
-            "--sglang-cuda-graph-max-bs 32 "
+            "--sglang-cuda-graph-max-bs 16 "
             "--sglang-enable-metrics "
         )
 
-        delta_args = (
-            "--update-weight-mode delta "
+        disk_update_args = (
+            "--update-weight-mode full "
             "--update-weight-transport disk "
-            "--update-weight-encoding deltas "
-            f"--update-weight-disk-dir {delta_dir} "
-            "--update-weight-delta-keep-files "
+            f"--update-weight-disk-dir {quote(str(update_weight_dir))} "
         )
 
         ci_args = "--ci-test "
@@ -110,7 +115,8 @@ def execute():
             "--attention-backend flash "
             "--loss-mask-type qwen3_5 "
             "--actor-num-nodes 1 "
-            "--actor-num-gpus-per-node 1 "
+            f"--actor-num-gpus-per-node {NUM_GPUS} "
+            "--colocate "
         )
 
         train_args = (
@@ -121,7 +127,7 @@ def execute():
             f"{U.get_default_wandb_args(__file__)} "
             f"{perf_args} "
             f"{sglang_args} "
-            f"{delta_args} "
+            f"{disk_update_args} "
             f"{ci_args} "
             f"{misc_args} "
         )
@@ -132,8 +138,8 @@ def execute():
             megatron_model_type=MODEL_TYPE,
         )
 
-        delta_files = list(Path(delta_dir).glob("weight_v*/*.safetensors"))
-        assert delta_files, f"No disk delta safetensors were written under {delta_dir}"
+        latest_checkpoint = save_dir / "latest_checkpointed_iteration.txt"
+        assert latest_checkpoint.exists(), f"No Megatron checkpoint was saved under {save_dir}"
 
 
 if __name__ == "__main__":

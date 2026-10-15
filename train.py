@@ -42,6 +42,7 @@ def _shutdown_training_models(actor_model, critic_model):
 
 def train(args):
     configure_logger()
+    release_train = args.release_train
     rollout_manager = None
     actor_model = None
     critic_model = None
@@ -56,7 +57,7 @@ def train(args):
         rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
         actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 
-        if args.offload_rollout:
+        if args.offload_rollout and not release_train:
             ray.get(rollout_manager.onload_weights.remote())
         actor_model.update_weights()
         if args.check_weight_update_equal:
@@ -79,12 +80,12 @@ def train(args):
             if actor_trains_this_step:
                 actor_model.save_model(
                     rollout_id,
-                    force_sync=rollout_id == args.num_rollout - 1,
+                    force_sync=release_train or rollout_id == args.num_rollout - 1,
                 )
             if args.use_critic:
                 critic_model.save_model(
                     rollout_id,
-                    force_sync=rollout_id == args.num_rollout - 1,
+                    force_sync=release_train or rollout_id == args.num_rollout - 1,
                 )
             if args.rollout_global_dataset:
                 ray.get(rollout_manager.save.remote(rollout_id))
@@ -99,6 +100,9 @@ def train(args):
                 ray.get(rollout_manager.quiesce.remote())
                 ray.get(rollout_manager.offload.remote())
 
+            if release_train:
+                actor_model.create()
+
             actor_trains_this_step = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
             if args.use_critic:
                 value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
@@ -110,7 +114,7 @@ def train(args):
                 ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
 
             ray.get(rollout_manager.quiesce.remote())
-            if should_run_periodic_action(
+            if release_train or should_run_periodic_action(
                 rollout_id,
                 args.save_interval,
                 num_rollout_per_epoch,
@@ -119,7 +123,7 @@ def train(args):
                 save(rollout_id)
 
             offload_train(actor_trains_this_step)
-            if args.offload_rollout:
+            if args.offload_rollout and not release_train:
                 ray.get(rollout_manager.onload_weights.remote())
             actor_model.update_weights()
 

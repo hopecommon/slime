@@ -1,4 +1,4 @@
-ARG SGLANG_IMAGE_TAG=v0.5.12.post1-cu129
+ARG SGLANG_IMAGE_TAG=v0.5.15.post1-cu129
 FROM slimerl/sglang:${SGLANG_IMAGE_TAG} AS sglang
 
 # ======================================== Arguments =============================================
@@ -20,22 +20,24 @@ RUN apt install -y nvtop rsync dnsutils prometheus
 
 # ====================================== Python dependencies ============================================
 
-# The compilation is slow, thus should be put at top
-# TransformerEngines does not support too high FA2
-RUN MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation
+# The SGLang base image may include FA4.  The validated TE 2.16 CP stack uses
+# FA2 + FA3, so remove FA4 explicitly to avoid backend selection conflicts.
+RUN pip uninstall -y flash-attn-4 flash_attn_4 || true
 
 # The compilation is slow, thus should be put at top
+RUN MAX_JOBS=64 pip -v install flash-attn==2.8.3 --no-build-isolation
+
+# The compilation is slow, thus should be put at top.  This FA3 commit uses the
+# window_size_left/window_size_right API required by TransformerEngine 2.16 CP.
 RUN git clone https://github.com/Dao-AILab/flash-attention.git && \
-    cd flash-attention/ && git checkout fbf24f67cf7f6442c5cfb2c1057f4bfc57e72d89 && git submodule update --init && cd hopper/ && \
-    MAX_JOBS=96 python setup.py install && \
-    export python_path=`python -c "import site; print(site.getsitepackages()[0])"` && \
-    mkdir -p $python_path/flash_attn_3 && \
-    cp flash_attn_interface.py $python_path/flash_attn_3/flash_attn_interface.py && \
-    rm -rf flash-attention/
+    cd flash-attention/ && git checkout 002cce0a1068f8c07dfccb5a1d232b9a3276947c && git submodule update --init && \
+    cd hopper/ && \
+    FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=96 pip -v install . --no-build-isolation && \
+    cd /root/ && rm -rf flash-attention/
 
 RUN pip install git+https://github.com/ISEEKYAN/mbridge.git@89eb10887887bc74853f89a4de258c0702932a1c --no-deps
 
-RUN pip install flash-linear-attention==0.4.1
+RUN pip install flash-linear-attention==0.4.2
 # FlashQLA: optional GDN backend for Qwen3.5/Qwen3-Next (--qwen-gdn-backend flashqla; requires SM90+)
 RUN pip install git+https://github.com/QwenLM/FlashQLA.git --no-build-isolation
 RUN pip install tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
@@ -43,9 +45,9 @@ RUN pip install tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
 # TE does not have wheel on cuda 13 yet, thus need to install from source
 RUN if [ "${ENABLE_CUDA_13}" = "1" ]; then \
       pip install nvidia-mathdx==26.6.0 && \
-      pip -v install --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.10; \
+      pip -v install --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.16; \
     else \
-      pip -v install --no-build-isolation "transformer_engine[pytorch]==2.10.0"; \
+      pip -v install --no-build-isolation "transformer_engine[pytorch]==2.16.1"; \
     fi
 
 RUN NVCC_APPEND_FLAGS="--threads 4" \
@@ -78,13 +80,11 @@ RUN if [ "$ENABLE_CUDA_13" = "1" ]; then \
     python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps; \
   fi
 
-# https://github.com/pytorch/pytorch/issues/168167
-RUN pip install nvidia-cudnn-cu12==9.16.0.29
+# Megatron currently requires NumPy 1.x, while SciPy 1.18+ requires NumPy 2.x.
+# Pin both packages together so downgrading NumPy does not leave an incompatible SciPy.
+RUN pip install "numpy==1.26.4" "scipy==1.17.1"
 
-# reinstall numpy 1.x for megatron
-RUN pip install "numpy<2"
-
-RUN pip install https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-1117d05/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl --force-reinstall
+RUN pip install https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-9daabcd/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl --force-reinstall
 RUN python -c "import sglang_router; assert 'slime' in sglang_router.__version__"
 
 RUN rm -rf /root/.cache/pip /root/flash-attention
@@ -103,16 +103,20 @@ RUN cd Megatron-LM && \
 
 # TODO temporarily skip patching for GB200/GB300 (and require users to bring their own sglang version). should add back later.
 ARG ENABLE_SGLANG_PATCH=1
-COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
+COPY docker/patch/${PATCH_VERSION}/sglang*.patch /sgl-workspace/sglang/
 RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
   cd /sgl-workspace/sglang && \
-  git update-index --refresh && \
-  git apply sglang.patch --3way && \
-  if grep -R -n '^<<<<<<< ' .; then \
-    echo "Patch failed to apply cleanly. Please resolve conflicts." && \
-    exit 1; \
-  fi && \
-  rm sglang.patch; \
+  for patch in sglang.patch sglang-top_p.patch sglang-release_hicache.patch sglang-pull_weights.patch; do \
+    if [ ! -f "$patch" ]; then \
+      continue; \
+    fi; \
+    if ! git apply --check "$patch"; then \
+      echo "Patch $patch does not apply to the SGLang source in the base image."; \
+      exit 1; \
+    fi; \
+    git apply "$patch" || exit 1; \
+  done && \
+  rm sglang*.patch; \
 fi
 
 # ====================================== Install main package ============================================

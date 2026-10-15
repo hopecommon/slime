@@ -43,6 +43,7 @@ def _shutdown_training_models(actor_model, critic_model):
 def train(args):
     assert not args.colocate, "Colocation is not supported for async training."
     configure_logger()
+    release_train = args.release_train
     rollout_manager = None
     actor_model = None
     critic_model = None
@@ -74,13 +75,13 @@ def train(args):
             rollout_data_curr_ref = ray.get(rollout_data_next_future)
             rollout_data_next_future = None
 
-            save_due = should_run_periodic_action(
+            save_due = release_train or should_run_periodic_action(
                 rollout_id,
                 args.save_interval,
                 num_rollout_per_epoch,
                 args.num_rollout,
             )
-            update_due = (rollout_id + 1) % args.update_weights_interval == 0
+            update_due = release_train or (rollout_id + 1) % args.update_weights_interval == 0
             eval_due = should_run_periodic_action(
                 rollout_id,
                 args.eval_interval,
@@ -90,6 +91,9 @@ def train(args):
 
             if rollout_id + 1 < args.num_rollout and not boundary_due:
                 rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
+
+            if release_train:
+                actor_model.create()
 
             if args.use_critic:
                 actor_trains_this_step = rollout_id >= args.num_critic_only_steps
@@ -108,12 +112,12 @@ def train(args):
                 if (not args.use_critic) or rollout_id >= args.num_critic_only_steps:
                     actor_model.save_model(
                         rollout_id,
-                        force_sync=rollout_id == args.num_rollout - 1,
+                        force_sync=release_train or rollout_id == args.num_rollout - 1,
                     )
                 if args.use_critic:
                     critic_model.save_model(
                         rollout_id,
-                        force_sync=rollout_id == args.num_rollout - 1,
+                        force_sync=release_train or rollout_id == args.num_rollout - 1,
                     )
                 if args.rollout_global_dataset:
                     ray.get(rollout_manager.save.remote(rollout_id))

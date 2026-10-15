@@ -20,6 +20,7 @@ from slime.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupCo
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
+from slime.utils.data import get_source
 from slime.utils.dp_schedule import build_dp_schedule
 from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import (
@@ -47,6 +48,18 @@ logger = logging.getLogger(__name__)
 ROLLOUT_ENGINE_SHUTDOWN_TIMEOUT_SECONDS = 60.0
 _router_processes: list[multiprocessing.Process] = []
 
+
+_ROLLOUT_DATA_TENSOR_DTYPES = {
+    "tokens": torch.long,
+    "loss_masks": torch.int,
+    "rollout_log_probs": torch.float32,
+    "rollout_top_p_token_ids": torch.int32,
+    "rollout_top_p_token_offsets": torch.int32,
+    "teacher_log_probs": torch.float32,
+    "rollout_routed_experts": None,
+}
+
+
 _SGLANG_REQUEST_PERF_FIELDS = (
     ("request/e2e_latency", "e2e_latency"),
     ("request/queue_time", "queue_time"),
@@ -69,6 +82,38 @@ _SGLANG_DECODE_PERF_FIELDS = (
     ("decode/transfer_duration", "pd_decode_transfer_duration"),
     ("decode/forward_duration", "pd_decode_forward_duration"),
 )
+
+
+def _cpu_tensor(value, dtype: torch.dtype | None = None) -> torch.Tensor:
+    if isinstance(value, np.ndarray) and not value.flags.writeable:
+        value = value.copy()
+    tensor = torch.as_tensor(value, dtype=dtype) if dtype is not None else torch.as_tensor(value)
+    return tensor.detach().cpu().contiguous()
+
+
+def _tensorize_rollout_data_for_training(rollout_data: dict[str, Any]) -> None:
+    for key, dtype in _ROLLOUT_DATA_TENSOR_DTYPES.items():
+        if key in rollout_data:
+            rollout_data[key] = [_cpu_tensor(value, dtype=dtype) for value in rollout_data[key]]
+
+    if "multimodal_train_inputs" in rollout_data:
+        rollout_data["multimodal_train_inputs"] = [
+            (
+                {
+                    key: _cpu_tensor(value) if isinstance(value, (np.ndarray, torch.Tensor)) else value
+                    for key, value in mm_dict.items()
+                }
+                if mm_dict is not None
+                else None
+            )
+            for mm_dict in rollout_data["multimodal_train_inputs"]
+        ]
+
+    if "rollout_mask_sums" in rollout_data:
+        rollout_data["rollout_mask_sums"] = _cpu_tensor(
+            rollout_data["rollout_mask_sums"],
+            dtype=torch.float32,
+        )
 
 
 @dataclasses.dataclass
@@ -103,6 +148,18 @@ class ServerGroup:
         """Node-0 engines only (for multi-node serving)."""
         return self.all_engines[:: self.nodes_per_engine]
 
+    def parallel_config(self) -> dict[str, Any]:
+        """Return the SGLang parallel args that affect rank-local expert routing."""
+        overrides = {key.replace("-", "_"): value for key, value in self.sglang_overrides.items()}
+        pp_size = int(overrides.get("pp_size", getattr(self.args, "sglang_pp_size", 1)))
+        tp_size = int(overrides.get("tp_size", self.num_gpus_per_engine // pp_size))
+        return {
+            "tp_size": tp_size,
+            "pp_size": pp_size,
+            "ep_size": int(overrides.get("ep_size", getattr(self.args, "sglang_ep_size", 1))),
+            "moe_dp_size": int(overrides.get("moe_dp_size", getattr(self.args, "sglang_moe_dp_size", 1))),
+        }
+
     def start_engines(self, port_cursors: dict[int, int] | None = None) -> tuple[list, dict[int, int]]:
         """Create Ray actors, allocate ports, and fire ``engine.init()`` without waiting.
 
@@ -120,14 +177,14 @@ class ServerGroup:
             self.num_new_engines = 0
             return [], port_cursors
 
-        num_gpu_per_engine = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
+        num_gpus_per_engine_on_node = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
 
         pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
         validate_server_group_gpu_indices(
             worker_type=self.worker_type,
             gpu_offset=self.gpu_offset,
             num_gpus_per_engine=self.num_gpus_per_engine,
-            num_gpu_per_engine=num_gpu_per_engine,
+            num_gpus_per_engine_on_node=num_gpus_per_engine_on_node,
             num_engines=len(self.all_engines),
             num_available_gpus=len(reordered_gpu_ids),
             rollout_num_gpus=self.args.rollout_num_gpus,
@@ -146,7 +203,7 @@ class ServerGroup:
             num_cpus = num_gpus
 
             # Get the base GPU ID from placement group using gpu_offset.
-            gpu_index = self.gpu_offset + i * num_gpu_per_engine
+            gpu_index = self.gpu_offset + i * num_gpus_per_engine_on_node
             base_gpu_id = int(reordered_gpu_ids[gpu_index])
 
             scheduling_strategy = PlacementGroupSchedulingStrategy(
@@ -166,7 +223,6 @@ class ServerGroup:
                     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
                     "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
-                    "SLIME_ENABLE_PROFILING": "true",
                 }.items()
             }
             rollout_engine = RolloutRayActor.options(
@@ -235,18 +291,6 @@ class ServerGroup:
             return []
         return [engine.resume_memory_occupation.remote(tags=tags) for engine in self.engines if engine is not None]
 
-    def onload_weights_from_disk(self):
-        """Reload weights from ``model_path`` for non-updatable groups.
-
-        Used instead of ``resume_memory_occupation(tags=[WEIGHTS])`` so that
-        CPU memory is not consumed by offloaded weight copies.
-        """
-        if not self.needs_offload or not self.model_path:
-            return []
-        return [
-            engine.update_weights_from_disk.remote(self.model_path) for engine in self.engines if engine is not None
-        ]
-
 
 @dataclasses.dataclass
 class RolloutServer:
@@ -298,6 +342,11 @@ class RolloutServer:
             for j in range(len(g.engines)):
                 offsets.append(g.gpu_offset + j * g.num_gpus_per_engine)
         return offsets
+
+    @property
+    def engine_parallel_configs(self) -> list[dict[str, Any]]:
+        """Per-engine SGLang parallel config, parallel to ``engines``."""
+        return [g.parallel_config() for g in self.server_groups for _ in g.engines]
 
     @property
     def nodes_per_engine(self):
@@ -397,6 +446,13 @@ class RolloutManager:
         self.pg = pg
         self.args = args
 
+        rollout_init_handles: list[Any] = []
+        if self.args.debug_train_only:
+            self.servers: dict[str, Any] = {}
+        else:
+            init_http_client(args)
+            self.servers, rollout_init_handles = start_rollout_servers(args, pg)
+
         data_source_cls = load_function(self.args.data_source_path)
         self.data_source = data_source_cls(args)
 
@@ -413,11 +469,8 @@ class RolloutManager:
         logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
         logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
 
-        if self.args.debug_train_only:
-            self.servers: dict[str, Any] = {}
-        else:
-            init_http_client(args)
-            self.servers = start_rollout_servers(args, pg)
+        if rollout_init_handles:
+            ray.get(rollout_init_handles)
 
         init_tracking(args, primary=False)
         self.rollout_engine_lock = Lock.options(
@@ -435,23 +488,6 @@ class RolloutManager:
                     monitor.start()
                     self._health_monitors.append(monitor)
             self._ci_fault_injection_pending = self.args.ci_test  # Flag for CI fault injection
-
-    def _get_metrics_router_addr(self) -> str | None:
-        """Return the router address for scraping SGLang engine metrics.
-
-        The sglang_router gateway exposes ``/engine_metrics`` on its main port,
-        which aggregates Prometheus metrics from all backend sglang servers.
-        Returns ``http://{ip}:{port}`` for the first server, or ``None`` when
-        metrics are disabled or no servers are running.
-        """
-        srv = self.server
-        if srv is None or srv.router_ip is None:
-            return None
-        return f"http://{srv.router_ip}:{srv.router_port}"
-
-    def get_metrics_router_addr(self) -> str | None:
-        """Public wrapper for remote calls from the driver process."""
-        return self._get_metrics_router_addr()
 
     def _try_ci_fault_injection(self):
         """Try to inject fault during generate (when health monitor is running)."""
@@ -595,8 +631,9 @@ class RolloutManager:
         engines = srv.engines if srv else []
         gpu_counts = srv.engine_gpu_counts if srv else []
         gpu_offsets = srv.engine_gpu_offsets if srv else []
+        parallel_configs = srv.engine_parallel_configs if srv else []
         num_new = srv.num_new_engines if srv else 0
-        return engines, self.rollout_engine_lock, num_new, gpu_counts, gpu_offsets
+        return engines, self.rollout_engine_lock, num_new, gpu_counts, gpu_offsets, parallel_configs
 
     def get_num_rollout_per_epoch(self):
         assert self.args.rollout_global_dataset
@@ -659,7 +696,7 @@ class RolloutManager:
             srv.onload_kv()
 
     def recover_updatable_engines(self):
-        """Restart any dead rollout engines and update num_new_engines for update_weights detection.
+        """Restart dead updatable rollout engines before the next weight update.
 
         Recovers the updatable model (the one that receives weight
         updates from training).
@@ -668,19 +705,9 @@ class RolloutManager:
         self.health_monitoring_pause()
         srv = self._get_updatable_server()
         if self.rollout_id == -1 or srv is None:
-            engines = srv.engines if srv else []
-            gpu_counts = srv.engine_gpu_counts if srv else []
-            gpu_offsets = srv.engine_gpu_offsets if srv else []
-            return engines, self.rollout_engine_lock, (srv.num_new_engines if srv else 0), gpu_counts, gpu_offsets
+            return
 
         srv.recover()
-        return (
-            srv.engines,
-            self.rollout_engine_lock,
-            srv.num_new_engines,
-            srv.engine_gpu_counts,
-            srv.engine_gpu_offsets,
-        )
 
     def clear_updatable_num_new_engines(self):
         # when fault tolerance is not enabled, we need to manually clear num_new_engines after update_weights
@@ -756,7 +783,7 @@ class RolloutManager:
 
         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
         if (
-            self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
+            self.args.advantage_estimator in ["grpo", "gspo", "cispo", "reinforce_plus_plus_baseline"]
             and self.args.rewards_normalization
         ):
             # group norm
@@ -769,7 +796,7 @@ class RolloutManager:
             mean = rewards.mean(dim=-1, keepdim=True)
             rewards = rewards - mean
 
-            if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
+            if self.args.advantage_estimator in ["grpo", "gspo", "cispo"] and self.args.grpo_std_normalization:
                 std = rewards.std(dim=-1, keepdim=True)
                 rewards = rewards / (std + 1e-6)
 
@@ -860,6 +887,22 @@ class RolloutManager:
         if samples[0].rollout_log_probs is not None:
             train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
 
+        if getattr(self.args, "rollout_top_p", 1.0) != 1.0:
+            for sample in samples:
+                assert sample.rollout_top_p_token_ids is not None
+                assert sample.rollout_top_p_token_offsets is not None
+                assert len(sample.rollout_top_p_token_offsets) == sample.response_length + 1, (
+                    f"top-p token offsets length {len(sample.rollout_top_p_token_offsets)} "
+                    f"!= response length + 1 {sample.response_length + 1}"
+                )
+                offset_end = int(sample.rollout_top_p_token_offsets[-1])
+                assert offset_end == len(sample.rollout_top_p_token_ids), (
+                    f"top-p token offsets[-1] {offset_end} "
+                    f"!= token ids length {len(sample.rollout_top_p_token_ids)}"
+                )
+            train_data["rollout_top_p_token_ids"] = [sample.rollout_top_p_token_ids for sample in samples]
+            train_data["rollout_top_p_token_offsets"] = [sample.rollout_top_p_token_offsets for sample in samples]
+
         if samples[0].rollout_routed_experts is not None:
             train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
 
@@ -871,6 +914,9 @@ class RolloutManager:
 
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
+
+        if samples[0].metadata is not None:
+            train_data["source_names"] = [get_source(sample) for sample in samples]
 
         return train_data
 
@@ -918,7 +964,10 @@ class RolloutManager:
                 "rollout_ids",
                 "rollout_mask_sums",
                 "rollout_log_probs",
+                "rollout_top_p_token_ids",
+                "rollout_top_p_token_offsets",
                 "rollout_routed_experts",
+                "source_names",
                 "prompt",
                 "teacher_log_probs",
             ]:
@@ -933,7 +982,14 @@ class RolloutManager:
             rollout_data["global_batch_sizes"] = global_batch_sizes
             rollout_data["num_microbatches"] = num_microbatches
             rollout_data["micro_batch_indices"] = micro_batch_indices[r]
-            rollout_data_refs.append(Box(ray.put(rollout_data)))
+            _tensorize_rollout_data_for_training(rollout_data)
+            transport = getattr(self.args, "rollout_data_transport", "object-store")
+            if transport == "nixl":
+                rollout_data_refs.append(Box(ray.put(rollout_data, _tensor_transport="nixl")))
+            elif transport == "object-store":
+                rollout_data_refs.append(Box(ray.put(rollout_data)))
+            else:
+                raise ValueError(f"Unsupported rollout data transport: {transport!r}")
         return rollout_data_refs
 
 
@@ -1089,10 +1145,11 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
 
     if has_pd_disaggregation:
         router_args.pd_disaggregation = True
-        # Disable circuit breaker to prevent RDMA transfer timeouts from
-        # marking decode workers as dead. Timeouts are transient (PCIe
-        # contention under high load) and do not indicate a dead server.
-        router_args.disable_circuit_breaker = True
+
+    # Disable circuit breaker to prevent RDMA transfer timeouts from
+    # marking decode workers as dead. Timeouts are transient (PCIe
+    # contention under high load) and do not indicate a dead server.
+    router_args.disable_circuit_breaker = True
 
     # We will not use the health check from router.
     router_args.disable_health_check = True
@@ -1129,15 +1186,16 @@ def _compute_megatron_num_gpus(args) -> int:
     return num
 
 
-def start_rollout_servers(args, pg) -> dict[str, Any]:
-    """Start rollout servers: one per model, each with its own router.
+def start_rollout_servers(args, pg) -> tuple[dict[str, Any], list[Any]]:
+    """Start rollout servers without waiting for final engine initialization.
 
     Each model defined in the sglang config gets its own router and set
     of server groups.  Server groups within a model may have different
     ``num_gpus_per_engine`` (e.g. for PD disaggregation where prefill
     and decode use different TP sizes).
 
-    Returns a dict mapping model name → ``RolloutServer``.
+    Returns ``(servers, init_handles)`` where servers maps model name to
+    ``RolloutServer`` and init_handles contains pending ``engine.init`` refs.
 
     Note: ``init_http_client`` should be called separately before this,
     as the HTTP client is shared across all servers.
@@ -1148,6 +1206,7 @@ def start_rollout_servers(args, pg) -> dict[str, Any]:
     config = _resolve_sglang_config(args)
 
     servers: dict[str, RolloutServer] = {}
+    pending_init_handles: list[Any] = []
     gpu_offset = 0
     engine_offset = 0
 
@@ -1174,8 +1233,8 @@ def start_rollout_servers(args, pg) -> dict[str, Any]:
         def _make_group(group_cfg, router_ip, router_port, overrides_extra=None):
             nonlocal engine_offset, gpu_offset
             gpus_per_engine = group_cfg.num_gpus_per_engine
-            num_gpu_per_engine_local = min(gpus_per_engine, args.num_gpus_per_node)
-            num_engines = group_cfg.num_gpus // num_gpu_per_engine_local
+            num_gpus_per_engine_on_node = min(gpus_per_engine, args.num_gpus_per_node)
+            num_engines = group_cfg.num_gpus // num_gpus_per_engine_on_node
 
             group_abs_start = rollout_pg_offset + gpu_offset
             needs_offload = args.offload_rollout and group_abs_start < megatron_num_gpus
@@ -1211,6 +1270,8 @@ def start_rollout_servers(args, pg) -> dict[str, Any]:
 
         if has_epd:
             # --- Phase 1: start encoder groups, wait, collect URLs ---
+            # Encoder URLs are injected into the non-encoder workers' server args,
+            # so this phase must stay synchronous even though final LLM init is deferred.
             encoder_urls: list[str] = []
             for group_cfg in model_cfg.server_groups:
                 if group_cfg.worker_type != "encoder":
@@ -1241,8 +1302,7 @@ def start_rollout_servers(args, pg) -> dict[str, Any]:
                 non_encoder_handles.extend(handles)
                 server_groups.append(group)
 
-            if non_encoder_handles:
-                ray.get(non_encoder_handles)
+            pending_init_handles.extend(non_encoder_handles)
         else:
             # No EPD — start all groups in one pass (original path).
             all_init_handles: list = []
@@ -1252,8 +1312,7 @@ def start_rollout_servers(args, pg) -> dict[str, Any]:
                 all_init_handles.extend(handles)
                 server_groups.append(group)
 
-            if all_init_handles:
-                ray.get(all_init_handles)
+            pending_init_handles.extend(all_init_handles)
 
         servers[model_cfg.name] = RolloutServer(
             server_groups=server_groups,
@@ -1266,7 +1325,7 @@ def start_rollout_servers(args, pg) -> dict[str, Any]:
     # Expose per-model router info for custom rollout functions.
     args.sglang_model_routers = {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()}
 
-    return servers
+    return servers, pending_init_handles
 
 
 def _resolve_sglang_config(args) -> SglangConfig:
@@ -1278,6 +1337,9 @@ def _resolve_sglang_config(args) -> SglangConfig:
         actual = config.total_num_gpus
         assert actual == expected, f"sglang_config total GPUs ({actual}) != rollout_num_gpus ({expected})"
         return config
+
+    if args.rollout_num_gpus == 0:
+        return SglangConfig(models=[ModelConfig(name="default", server_groups=[])])
 
     if args.prefill_num_servers is not None:
         return SglangConfig.from_prefill_num_servers(args)
@@ -1353,6 +1415,7 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
+    log_dict |= _compute_top_p_kept_vocab_metrics(args, samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     return log_dict
@@ -1459,6 +1522,36 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
     interesting_rewards = [str(round(g[0].get_reward_value(args), 1)) for g in interesting_sample_groups]
 
     return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
+
+
+def _compute_top_p_kept_vocab_metrics(args, all_samples: list[Sample]):
+    total_kept = 0
+    total_tokens = 0
+    for sample in all_samples:
+        offsets = sample.rollout_top_p_token_offsets
+        if offsets is None or sample.response_length == 0:
+            continue
+        offsets = torch.as_tensor(offsets, dtype=torch.int64)
+        if offsets.numel() == 0:
+            continue
+        assert (
+            offsets.numel() == sample.response_length + 1
+        ), f"top-p token offsets length {offsets.numel()} != response length + 1 {sample.response_length + 1}"
+        if sample.remove_sample:
+            continue
+        if sample.loss_mask is None:
+            total_kept += int(offsets[-1] - offsets[0])
+            total_tokens += sample.response_length
+            continue
+        loss_mask = torch.as_tensor(sample.loss_mask, dtype=torch.bool, device=offsets.device)
+        assert (
+            loss_mask.numel() == sample.response_length
+        ), f"loss mask length {loss_mask.numel()} != response length {sample.response_length}"
+        total_kept += int(torch.diff(offsets)[loss_mask].sum())
+        total_tokens += int(loss_mask.sum())
+    if total_tokens == 0:
+        return {}
+    return {"top_p_kept_vocab_per_token": total_kept / total_tokens}
 
 
 def _compute_spec_metrics(args, all_samples: list[Sample]):
