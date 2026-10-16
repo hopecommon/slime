@@ -31,6 +31,10 @@ class TensorBackuper(ABC):
     def backup(self, tag: str):
         raise NotImplementedError
 
+    def discard(self, tag: str):
+        """Release a failed or retired named backup."""
+        raise NotImplementedError
+
     def copy(self, *, src_tag: str, dst_tag: str):
         raise NotImplementedError
 
@@ -50,6 +54,9 @@ class _TensorBackuperNormal(TensorBackuper):
 
     def get(self, tag: str):
         return self._backups[tag]
+
+    def discard(self, tag: str):
+        self._backups.pop(tag, None)
 
     @torch.no_grad()
     def backup(self, tag: str) -> None:
@@ -90,6 +97,9 @@ class _TensorBackuperNoop(TensorBackuper):
         ans = {k: v.detach() for k, v in ans.items()}
         assert _compute_hash_dict(ans) == self._backup_hash_dict
         return ans
+
+    def discard(self, tag: str):
+        raise ValueError("single-tag backuper retains its live model")
 
     def backup(self, tag: str) -> None:
         assert tag == self._single_tag

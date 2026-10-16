@@ -634,31 +634,15 @@ class MegatronTrainRayActor(TrainRayActor):
             destroy_process_groups()
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
-        old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
-        self.args.load = path
-        self.args.no_load_optim = True
-        self.args.no_load_rng = True
-        self.args.finetune = True
+        from slime.utils.other_checkpoint import load_other_checkpoint
 
-        old_ckpt_step = None
+        overrides = {}
         if model_tag == "ref" and self.args.ref_ckpt_step is not None:
-            old_ckpt_step = self.args.ckpt_step
-            self.args.ckpt_step = self.args.ref_ckpt_step
+            overrides["ckpt_step"] = self.args.ref_ckpt_step
         elif model_tag == "teacher" and self.args.opd_teacher_ckpt_step is not None:
-            old_ckpt_step = self.args.ckpt_step
-            self.args.ckpt_step = self.args.opd_teacher_ckpt_step
-
-        _, _ = load_checkpoint(
-            self.model,
-            None,
-            None,
-            checkpointing_context={},
-            skip_load_to_model_and_opt=False,
+            overrides["ckpt_step"] = self.args.opd_teacher_ckpt_step
+        load_other_checkpoint(
+            args=self.args, model=self.model, model_tag=model_tag, path=path,
+            load=load_checkpoint, backup=self.weights_backuper.backup, overrides=overrides,
         )
-        self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune = old_args
-
-        if old_ckpt_step is not None:
-            self.args.ckpt_step = old_ckpt_step
-
-        self.weights_backuper.backup(model_tag)
         self._active_model_tag = model_tag
