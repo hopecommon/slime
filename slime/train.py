@@ -40,7 +40,7 @@ def _shutdown_training_models(actor_model, critic_model):
         ) from errors[0]
 
 
-def train(args, *, actor_cls=None):
+def train(args, *, actor_cls=None, rollout_cleanup=None):
     configure_logger()
     release_train = args.release_train
     rollout_manager = None
@@ -54,7 +54,8 @@ def train(args, *, actor_cls=None):
         init_tracking(args)
         tracking_initialized = True
 
-        rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
+        manager_options = {} if rollout_cleanup is None else {"on_created": rollout_cleanup.adopt}
+        rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"], **manager_options)
         factory_options = {} if actor_cls is None else {"actor_cls": actor_cls}
         actor_model, critic_model = create_training_models(args, pgs, rollout_manager, **factory_options)
 
@@ -142,29 +143,50 @@ def train(args, *, actor_cls=None):
         raise
     finally:
         cleanup_errors = []
-        if rollout_manager is not None:
+        if rollout_cleanup is not None:
+            try:
+                # The selected lifetime owns the handle even if factory setup failed
+                # before returning it. A finite observation never authorizes kill.
+                rollout_cleanup.finish_foreground()
+            except BaseException as exc:
+                cleanup_errors.append(("rollout_cleanup", exc))
+        elif rollout_manager is not None:
             try:
                 _dispose_rollout_manager(rollout_manager)
             except BaseException as exc:
-                cleanup_errors.append(exc)
+                cleanup_errors.append(("rollout_cleanup", exc))
                 logger.exception("failed to dispose rollout manager")
         try:
             _shutdown_training_models(actor_model, critic_model)
         except BaseException as exc:
-            cleanup_errors.append(exc)
+            cleanup_errors.append(("model_shutdown", exc))
             logger.exception("failed to shut down training models")
         if tracking_initialized:
             try:
                 finish_tracking(args)
             except BaseException as exc:
-                cleanup_errors.append(exc)
+                cleanup_errors.append(("tracking_shutdown", exc))
                 logger.exception("failed to finish training tracking")
+        if active_error is not None:
+            for phase, error in cleanup_errors:
+                receipt = getattr(error, "receipt_path", None)
+                note = f"{phase}: {type(error).__name__}"
+                if receipt is not None:
+                    note += f"; receipt: {receipt}"
+                active_error.add_note(note)
+            if rollout_cleanup is not None:
+                rollout_cleanup.add_terminal_note(active_error)
         if cleanup_errors and active_error is None:
+            if rollout_cleanup is not None:
+                primary = cleanup_errors[0][1]
+                for phase, error in cleanup_errors[1:]:
+                    primary.add_note(f"{phase}: {type(error).__name__}")
+                raise primary
             if len(cleanup_errors) == 1:
-                raise cleanup_errors[0]
+                raise cleanup_errors[0][1]
             raise RuntimeError(
-                "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
-            ) from cleanup_errors[0]
+                "; ".join(f"{type(error).__name__}: {error}" for _, error in cleanup_errors)
+            ) from cleanup_errors[0][1]
 
 
 def main():

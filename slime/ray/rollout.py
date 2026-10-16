@@ -37,6 +37,7 @@ from slime.utils.misc import Box, group_by, load_function
 from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
+from .rollout_cleanup import RolloutCleanupReport
 from .rollout_validation import validate_server_group_gpu_indices
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock, add_default_ray_env_vars
 
@@ -515,39 +516,85 @@ class RolloutManager:
             except Exception as e:
                 logger.warning(f"CI Fault Injection failed: {e}")
 
-    def dispose(self):
+    def dispose(self, retain_unresolved=False):
+        if retain_unresolved or getattr(self, "_selected_closing", False):
+            return self._dispose_selected()
         errors = []
-        monitors_to_retry = []
         try:
             self._run_rollout_hook("shutdown_rollout")
         except BaseException as exc:
-            errors.append(f"rollout shutdown: {type(exc).__name__}: {exc}")
+            errors.append(("rollout_shutdown", exc))
+        errors.extend(self._dispose_core())
+        if errors:
+            raise RuntimeError("; ".join(
+                f"{phase.replace('_', ' ')}: {type(error).__name__}: {error}"
+                for phase, error in errors
+            ))
+
+    def _dispose_selected(self):
+        self._selected_closing = True
+        previous = getattr(self, "_selected_cleanup_report", None)
+        if previous is not None and previous.core_state != "not_started":
+            return previous
+        try:
+            self.health_monitoring_pause()
+            report = self._run_rollout_hook("shutdown_rollout")
+            if type(report) is not RolloutCleanupReport or report.core_state != "not_started":
+                raise TypeError("selected shutdown requires a lower-release report")
+        except BaseException as error:
+            report = RolloutCleanupReport(False, errors=(("selected_shutdown", type(error).__name__),))
+        self._selected_cleanup_report = report
+        if not report.selected_closed:
+            return report
+        try:
+            errors = self._dispose_core()
+        except BaseException as error:
+            errors = [("core_cleanup", error)]
+        # The destructive tail is terminal even if a sibling failed. A repeated
+        # dispose observes this result and cannot perform the destructive work twice.
+        self._selected_cleanup_report = RolloutCleanupReport(
+            True, "failed" if errors else "complete",
+            tuple((phase, type(error).__name__) for phase, error in errors),
+            report.receipts,
+        )
+        return self._selected_cleanup_report
+
+    def cleanup_status(self):
+        """Return retained selected evidence without admitting new work."""
+        return getattr(self, "_selected_cleanup_report", None)
+
+    def _require_open(self):
+        if getattr(self, "_selected_closing", False):
+            raise RuntimeError("selected rollout cleanup is closing")
+
+    def _dispose_core(self):
+        errors = []
+        monitors_to_retry = []
         for monitor in self._health_monitors:
             try:
                 monitor.stop()
             except TimeoutError:
                 monitors_to_retry.append(monitor)
             except BaseException as exc:
-                errors.append(f"health monitor stop: {type(exc).__name__}: {exc}")
+                errors.append(("health_monitor_stop", exc))
         try:
             self._shutdown_rollout_servers()
         except BaseException as exc:
-            errors.append(f"rollout server shutdown: {type(exc).__name__}: {exc}")
+            errors.append(("rollout_server_shutdown", exc))
         for monitor in monitors_to_retry:
             try:
                 monitor.stop()
             except BaseException as exc:
-                errors.append(f"health monitor stop after engine shutdown: {type(exc).__name__}: {exc}")
+                errors.append(("health_monitor_stop_after_engine_shutdown", exc))
         try:
             shutdown_http_client()
         except BaseException as exc:
-            errors.append(f"HTTP shutdown: {type(exc).__name__}: {exc}")
+            errors.append(("HTTP_shutdown", exc))
         try:
             logging_utils.finish_tracking(self.args)
         except BaseException as exc:
-            errors.append(f"tracking shutdown: {type(exc).__name__}: {exc}")
-        if errors:
-            raise RuntimeError("; ".join(errors))
+            errors.append(("tracking_shutdown", exc))
+        return errors
 
     def _shutdown_rollout_servers(self):
         engines = []
@@ -626,6 +673,7 @@ class RolloutManager:
         ``update_weights=True``.  Frozen models (reference, reward,
         etc.) are automatically excluded.
         """
+        self._require_open()
         self.quiesce()
         srv = self._get_updatable_server()
         engines = srv.engines if srv else []
@@ -640,6 +688,7 @@ class RolloutManager:
         return len(self.data_source) // self.args.rollout_batch_size
 
     def generate(self, rollout_id):
+        self._require_open()
         start_time = time.time()
         self.rollout_id = rollout_id
         self.health_monitoring_resume()
@@ -655,6 +704,7 @@ class RolloutManager:
         return self._split_train_data_by_dp(data)
 
     def eval(self, rollout_id):
+        self._require_open()
         if self.args.debug_train_only:
             # if debug train only, we don't generate evaluation data
             return
@@ -671,27 +721,33 @@ class RolloutManager:
         _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
 
     def save(self, rollout_id):
+        self._require_open()
         self.quiesce()
         self.data_source.save(rollout_id)
 
     def load(self, rollout_id=None):
+        self._require_open()
         self.data_source.load(rollout_id)
 
     def offload(self):
+        self._require_open()
         self.quiesce()
         self.health_monitoring_pause()
         for srv in self.servers.values():
             srv.offload()
 
     def onload(self, tags: list[str] | None = None):
+        self._require_open()
         for srv in self.servers.values():
             srv.onload(tags)
 
     def onload_weights(self):
+        self._require_open()
         for srv in self.servers.values():
             srv.onload_weights()
 
     def onload_kv(self):
+        self._require_open()
         for srv in self.servers.values():
             srv.onload_kv()
 
@@ -701,6 +757,7 @@ class RolloutManager:
         Recovers the updatable model (the one that receives weight
         updates from training).
         """
+        self._require_open()
         self.quiesce()
         self.health_monitoring_pause()
         srv = self._get_updatable_server()
@@ -710,6 +767,7 @@ class RolloutManager:
         srv.recover()
 
     def clear_updatable_num_new_engines(self):
+        self._require_open()
         # when fault tolerance is not enabled, we need to manually clear num_new_engines after update_weights
         srv = self._get_updatable_server()
         if srv:
@@ -720,10 +778,12 @@ class RolloutManager:
             monitor.pause()
 
     def health_monitoring_resume(self) -> None:
+        self._require_open()
         for monitor in self._health_monitors:
             monitor.resume()
 
     def check_weights(self, action: str):
+        self._require_open()
         return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])
 
     def _get_rollout_data(self, rollout_id):
@@ -921,6 +981,7 @@ class RolloutManager:
         return train_data
 
     def set_train_parallel_config(self, config: dict):
+        self._require_open()
         self.train_parallel_config = config
 
     def _split_train_data_by_dp(self, data):

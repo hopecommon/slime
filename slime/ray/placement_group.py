@@ -235,7 +235,7 @@ def create_training_models(args, pgs, rollout_manager, actor_cls=None):
         raise
 
 
-def create_rollout_manager(args, pg):
+def create_rollout_manager(args, pg, *, on_created=None):
     from .rollout import RolloutManager
 
     rollout_manager_options = {
@@ -246,6 +246,8 @@ def create_rollout_manager(args, pg):
     if getattr(args, "rollout_data_transport", "object-store") == "nixl":
         rollout_manager_options["enable_tensor_transport"] = True
     rollout_manager = RolloutManager.options(**rollout_manager_options).remote(args, pg)
+    if on_created is not None:
+        on_created(rollout_manager)
 
     # calculate num_rollout from num_epoch
     num_rollout_per_epoch = None
