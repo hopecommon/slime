@@ -969,13 +969,14 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "source_names",
                 "prompt",
+                "field_refs",
                 "teacher_log_probs",
             ]:
                 if key not in data:
                     continue
                 rollout_data[key] = [data[key][j] for j in partition]
             # keys that need to be splited at train side
-            for key in ["raw_reward", "total_lengths"]:
+            for key in ["raw_reward", "total_lengths", "field_ref_batch"]:
                 if key not in data:
                     continue
                 rollout_data[key] = data[key]

@@ -232,7 +232,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self._switch_model("actor")
         print_memory("after wake_up model")
 
-    def _get_rollout_data(self, rollout_data_ref: Box) -> RolloutBatch:
+    def _get_rollout_data(self, rollout_data_ref: Box, *, rollout_id=None) -> RolloutBatch:
         # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
         # Both first pp stage and the last pp stage will receive the data.
         rollout_data = process_rollout_data(
@@ -240,6 +240,12 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_data_ref,
             mpu.get_data_parallel_rank(with_context_parallel=False),
             mpu.get_data_parallel_world_size(with_context_parallel=False),
+            context={
+                "role": self.role, "rank": self._rank, "world_size": self._world_size,
+                "dp_rank": mpu.get_data_parallel_rank(with_context_parallel=False),
+                "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
+                "rollout_id": rollout_id,
+            },
         )
         # TODO: this is ugly, move to somewhere else?
         # move tokens to GPU in advance
@@ -369,7 +375,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.wake_up()
 
         with timer("data_preprocess"):
-            rollout_data = self._get_rollout_data(rollout_data_ref)
+            rollout_data = self._get_rollout_data(rollout_data_ref, rollout_id=rollout_id)
 
         if self.role == "critic":
             result = self.train_critic(rollout_id, rollout_data)

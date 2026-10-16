@@ -289,7 +289,7 @@ class Dataset:
         return len(self.samples)
 
 
-def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
+def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size, *, context=None):
     assert len(rollout_data_ref) == dp_size
     rollout_data = ray.get(rollout_data_ref[dp_rank].inner)
 
@@ -300,6 +300,15 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
     Timer().seq_lens = total_lengths
     rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
 
+    preprocess = getattr(args, "rollout_data_preprocess_path", None)
+    if preprocess:
+        if context is None:
+            raise ValueError("rollout-data preprocess hook requires physical reader context")
+        from slime.utils.misc import load_function
+
+        load_function(preprocess)(args, rollout_data, context=context)
+    if "field_refs" in rollout_data or "field_ref_batch" in rollout_data:
+        raise ValueError("rollout-data preprocess hook must consume field references")
     return rollout_data
 
 

@@ -535,6 +535,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
 
             parser.add_argument(
+                "--rollout-data-preprocess-path", type=str, default=None,
+                help="CPU DP-shard hook before CP/device transforms: fn(args, data, *, context).",
+            )
+            parser.add_argument(
                 "--rollout-data-postprocess-path",
                 type=str,
                 default=None,
