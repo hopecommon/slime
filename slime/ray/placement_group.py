@@ -1,6 +1,7 @@
 import copy
 import logging
 import socket
+from pathlib import Path
 
 import ray
 from ray.util.placement_group import placement_group
@@ -215,13 +216,17 @@ def create_training_models(args, pgs, rollout_manager, actor_cls=None):
         else:
             start_rollout_ids = actor_start_rollout_ids
 
-        assert len(set(start_rollout_ids)) == 1
-
-        if args.start_rollout_id is None:
-            args.start_rollout_id = start_rollout_ids[0]
+        model_start = None
+        if getattr(args, "rollout_source_checkpoint", None) is not None:
+            model_start = _selected_model_start(args, start_rollout_ids)
+        else:
+            assert len(set(start_rollout_ids)) == 1
+            if args.start_rollout_id is None:
+                args.start_rollout_id = start_rollout_ids[0]
 
         if args.rollout_global_dataset:
-            ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
+            options = {} if model_start is None else {"model_start": model_start}
+            ray.get(rollout_manager.load.remote(args.start_rollout_id - 1, **options))
 
         return actor_model, critic_model
     except BaseException:
@@ -233,6 +238,33 @@ def create_training_models(args, pgs, rollout_manager, actor_cls=None):
             except BaseException:
                 logger.exception("failed to shut down partially initialized training model")
         raise
+
+
+def _selected_model_start(args, starts):
+    """Attest actual initialized actor IDs before the selected source adopts state."""
+    contract = args.rollout_source_checkpoint
+    fields = {"version", "mode", "checkpoint", "source_root", "initial_model_root", "selection_sha256", "model_identity"}
+    if not isinstance(contract, dict) or set(contract) != fields or contract["version"] != 1:
+        raise ValueError("invalid selected model/source checkpoint contract")
+    mode, checkpoint = contract["mode"], contract["checkpoint"]
+    if (mode not in {"initial", "resume"} or type(checkpoint) is not int
+            or (checkpoint != -1 if mode == "initial" else checkpoint < 0)):
+        raise ValueError("invalid selected checkpoint launch mode/ID")
+    expected = 1 if mode == "initial" else checkpoint + 1
+    if (not starts or any(type(value) is not int or value != expected for value in starts)
+            or args.megatron_config_path is not None or args.use_critic
+            or args.megatron_to_hf_mode != "bridge" or args.ckpt_step is not None):
+        raise ValueError("actual selected model initialization differs")
+    start = 0 if mode == "initial" else expected
+    if args.start_rollout_id not in {None, start}:
+        raise ValueError("selected start override differs from the actual model")
+    source_root = str(Path(contract["source_root"]).resolve())
+    model_root = contract["initial_model_root"] if mode == "initial" else source_root
+    if (str(Path(args.save).resolve()) != source_root or str(Path(args.load).resolve()) != model_root
+            or (mode == "resume" and (args.finetune or args.no_load_optim or args.no_load_rng))):
+        raise ValueError("selected physical model/source checkpoint differs")
+    args.start_rollout_id = start
+    return {**contract, "actor_start_ids": list(starts), "start_rollout_id": start}
 
 
 def create_rollout_manager(args, pg, *, on_created=None):

@@ -13,11 +13,9 @@ import numpy as np
 import ray
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from slime.backends.sglang_utils.external import start_external_rollout_servers
 from slime.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
-from slime.backends.sglang_utils.sglang_engine import SGLangEngine
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
 from slime.utils.data import get_source
@@ -191,6 +189,8 @@ class ServerGroup:
             rollout_num_gpus=self.args.rollout_num_gpus,
             rollout_num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
         )
+
+        from slime.backends.sglang_utils.sglang_engine import SGLangEngine
 
         RolloutRayActor = ray.remote(SGLangEngine)
 
@@ -393,6 +393,8 @@ class RolloutServer:
             for _model_path, engines in non_updatable_groups_engines:
                 all_resume_engines.extend(engines)
             if all_resume_engines:
+                from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+
                 ray.get(
                     [
                         engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS])
@@ -426,6 +428,8 @@ class RolloutServer:
         for g in self.server_groups:
             if not g.needs_offload:
                 continue
+            from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+
             handles.extend(g.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
         return ray.get(handles) if handles else []
 
@@ -433,6 +437,8 @@ class RolloutServer:
         """Resume KV cache and CUDA graphs for offloaded groups."""
         handles = []
         for g in self.server_groups:
+            from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE
+
             handles.extend(g.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]))
         return ray.get(handles) if handles else []
 
@@ -725,9 +731,16 @@ class RolloutManager:
         self.quiesce()
         self.data_source.save(rollout_id)
 
-    def load(self, rollout_id=None):
+    def load(self, rollout_id=None, *, model_start=None):
         self._require_open()
-        self.data_source.load(rollout_id)
+        if model_start is None:
+            if getattr(self.args, "rollout_source_checkpoint", None) is not None:
+                raise ValueError("selected source load requires actual model attestation")
+            self.data_source.load(rollout_id)
+        else:
+            if getattr(self.args, "rollout_source_checkpoint", None) is None:
+                raise ValueError("model attestation requires a selected source")
+            self.data_source.load(rollout_id, model_start=model_start)
 
     def offload(self):
         self._require_open()
